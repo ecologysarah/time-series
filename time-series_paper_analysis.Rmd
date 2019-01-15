@@ -1,0 +1,973 @@
+---
+title: "Fungal control of early-stage bacterial community development in wood"
+author: "Sarah Johnston"
+date: "26 August 2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+## Load the requisite packages
+```{r load_packages, results='hide'}
+library(dplyr)
+library(lsmeans)
+library(MASS)
+library(metacoder)
+library(vegan)
+```
+### Multiplot function (from http://www.cookbook-r.com/Graphs/Multiple_graphs_on_one_page_(ggplot2)/)
+```{r multiplot}
+multiplot <- function(..., plotlist=NULL, file, cols=1, layout=NULL) {
+  library(grid)
+  
+  # Make a list from the ... arguments and plotlist
+  plots <- c(list(...), plotlist)
+  
+  numPlots = length(plots)
+  
+  # If layout is NULL, then use 'cols' to determine layout
+  if (is.null(layout)) {
+    # Make the panel
+    # ncol: Number of columns of plots
+    # nrow: Number of rows needed, calculated from # of cols
+    layout <- matrix(seq(1, cols * ceiling(numPlots/cols)),
+                     ncol = cols, nrow = ceiling(numPlots/cols))
+  }
+  
+  if (numPlots==1) {
+    print(plots[[1]])
+    
+  } else {
+    # Set up the page
+    grid.newpage()
+    pushViewport(viewport(layout = grid.layout(nrow(layout), ncol(layout))))
+    
+    # Make each plot, in the correct location
+    for (i in 1:numPlots) {
+      # Get the i,j matrix positions of the regions that contain this subplot
+      matchidx <- as.data.frame(which(layout == i, arr.ind = TRUE))
+      
+      print(plots[[i]], vp = viewport(layout.pos.row = matchidx$row,
+                                      layout.pos.col = matchidx$col))
+    }
+  }
+}
+```
+
+## Prepare the data for analysis
+###Bacterial data preparation
+Load in the bacterial OTU table.This is a .tsv with samples as columns, OTUs as rows. The first column is a list of OTU IDs, and the column headers are sample names. The last 7 columns contain taxonomy information for each OTU.
+There is also a file of sample metadata.
+```{r bact_input}
+#Read in OTUs
+eibact1<-read.delim('EI_OTU_table_with_taxonomy.tsv', header = TRUE)
+#Remova "X" from before numbers in column names, except for sample X
+colnames(eibact1)<-gsub("X([1-9]+)", "\\1", colnames(eibact1), fixed=FALSE)
+#Read in metadata
+eimetadata1<-read.delim('Earlham_metadat.tsv', header = TRUE)
+
+#Make the samples rows and OTUs columns
+#Need to exclude the first column (OTU IDs) and then add it in a column names on new dframe
+#Otherwise R will make the OTU IDs the first row, and set every column as factors
+#Also exclude the columns containing taxonomy info for now
+eibact2<-as.data.frame(t(eibact1[,2:70]))
+colnames(eibact2) <- eibact1$X.OTU.ID
+summary(eibact2[,1:5])
+summary(eibact1[,1:5])
+
+#Check that the samples are in the same order in the OTU and metadata tables
+#Check the order 
+all.equal(rownames(eibact2), as.character(eimetadata1$X.SampleID))
+#Sort both data frames to correct this
+eimetadata1<-eimetadata1[order(eimetadata1$X.SampleID),]
+eibact2<-eibact2[order(rownames(eibact2)),]
+#Check again
+all.equal(rownames(eibact2), as.character(eimetadata1$X.SampleID))
+
+#Calculate the sequencing depth for bacterial samples
+eidepth1<-(rowSums(eibact2))
+#See which samples have the most sequences
+eidepth1[order(eidepth1)]
+#Look at thresholds
+as.matrix(eidepth1[eidepth1 < 2000]) #Same 5 samples
+eimetadata1[eidepth1 < 2000,]
+
+#Remove samples below threshold of 2000 reads
+eibact3<-eibact2[eidepth1 > 2000,]
+eimetadata2<-eimetadata1[eidepth1 > 2000,]
+
+all.equal(rownames(eibact3), as.character(eimetadata2$X.SampleID))
+
+#Recalculate depth
+eidepth2<-(rowSums(eibact3))
+#Convert it to a value between 0-255, for later use in plotting
+max(eidepth2)/255 #=875.4
+grad<-eidepth2/876
+
+eimetadata2$Species<-factor(eimetadata2$Species, levels = c("C", "Vc", "Tv", "Hf"))
+eimetadata2$Day<-as.factor(eimetadata2$Day)
+eimetadata2$Set_sequential<-as.factor(eimetadata2$Set_sequential)
+eimetadata2$Season<-factor(eimetadata2$Season, levels=c("Autumn","Spring"))
+```
+
+###Read in the amplification success data
+This is a csv listing all samples, with a T/F column for whether bacteria could be amplified from the original DNA extractions.
+```{r success_data}
+success<-read.csv("success_rate.csv")
+success$Day<-as.factor(success$Day)
+success$Species<-factor(success$Species, levels = c("C", "Vc", "Tv", "Hf"))
+success$First_PCR<-as.character(success$First_PCR)
+success$First_PCR[success$First_PCR=="Failed"]<-"Negative"
+success$First_PCR[success$First_PCR=="Passed"]<-"Positive"
+success$First_PCR<-as.factor(success$First_PCR)
+#Check that all the samples in eimetadata2 passed in success: all did except R and W (which were re-extracted)
+success[success$Name %in% eimetadata2$X.SampleID,]
+#Search to see if any other re-extracted samples were included in the sequencing dataset
+reextracted<-c(25, 26, 28, "K", "N", 2, 7, 1841, 1846, 1850, 1859, 1862, "R", "S", "W")
+reextracted %in% success$Name #Found all except 1850, not previously extracted
+reextracted %in% eimetadata2$X.SampleID #Found none except R and S (2 is also in there, but as '2(2)'; likewise for 25 and 28; W was there but dropped)
+```
+
+###Read in fungal reisolation data
+This is a .csv indicating how many of the 8 reisolation points for each sample contained the precoloniser, how many contained other fungi, and how many contained bacteria.
+```{r reisolation_input}
+persist<-read.csv("autumn_reisolations.csv")
+persist$Species<-factor(persist$Species, levels = c("C", "Vc", "Tv", "Hf"))
+precol14<-factor(persist$Species[persist$Species!="C"&persist$Day=="14"], levels = c("Vc", "Tv", "Hf"))
+precol84<-factor(persist$Species[persist$Species!="C"&persist$Day=="84"], levels = c("Vc", "Tv", "Hf"))
+#Calculate the % of points that contained the precoloniser
+persist$percent.precol<-(persist$Precol/8)*100
+```
+
+##Explore the data
+###Explore the bacterial data
+```{r explore_bact_data}
+#Count number of replicates per treatment
+eimetadata2 %>% 
+  group_by(Season, Species, Day, Set) %>% 
+  tally()
+
+#Exploration of sequencing depth
+plot(eidepth2~eimetadata2$Season)
+plot(eidepth2~eimetadata2$Species)
+plot(eidepth2~eimetadata2$Day)
+plot(eidepth2~as.factor(eimetadata2$Extraction_kit))
+plot(eidepth2~eimetadata2$Set_sequential)
+
+
+##Plot the mean-variance relationship to look for overdipersion
+#Calculate the mean and variance for each column
+eibactmean<-apply (eibact3, 2, mean)
+eibactvar<- apply (eibact3, 2, var)
+#Plot them against each other
+#The original plot was squashed because of a few large values, so use log y-axis
+plot (eibactvar~eibactmean, log='y')
+#Add in a curved line of slope y=x^2
+curve(x^2, 0, 14000, add=TRUE)
+```
+
+###Explore precoloniser persistance (Fig S4)
+```{r figS4}
+pdf("persistence.pdf", height=8,width=6)
+{
+par(mfrow=c(2,1), mar=c(5,5,1,1))
+#Plot persistence at 14 days
+plot(persist$percent.precol[persist$Day=="14"&persist$Species!="C"]~precol14,
+     xlab="Precoloniser", ylab="Persistence (%)")
+legend("bottomleft", c("Control","Vc", "Tv", "Hf"), pch=c(20,20,20,20), bty="n", cex=0.8,
+       col=c((rgb(red=0,blue=0,green=0,maxColorValue=255)),(rgb(red=25,blue=255,green=178,maxColorValue=255)),
+             (rgb(red=50,blue=0,green=255,maxColorValue=255)),(rgb(red=229,blue=50,green=25,maxColorValue=255))))
+mtext("(A)", side=3, adj=-0.15)
+points(precol14[precol14=="Vc"],persist$percent.precol[persist$Species=="Vc"&persist$Day=="14"], pch=20, col=rgb(red=25,blue=255,green=178,maxColorValue=255))
+points(precol14[precol14=="Tv"],persist$percent.precol[persist$Species=="Tv"&persist$Day=="14"], pch=20, col=rgb(red=50,blue=0,green=255,maxColorValue=255))
+points(precol14[precol14=="Hf"],persist$percent.precol[persist$Species=="Hf"&persist$Day=="14"], pch=20, col=rgb(red=229,blue=50,green=25,maxColorValue=255))
+#Plot persistence at 84 days
+plot(persist$percent.precol[persist$Day=="84"&persist$Species!="C"]~precol84,
+     xlab="Precoloniser", ylab="Persistence (%)")
+legend("bottomleft", c("Control","Vc", "Tv", "Hf"), pch=c(20,20,20,20), bty="n", cex=0.8,
+       col=c((rgb(red=0,blue=0,green=0,maxColorValue=255)),(rgb(red=25,blue=255,green=178,maxColorValue=255)),
+             (rgb(red=50,blue=0,green=255,maxColorValue=255)),(rgb(red=229,blue=50,green=25,maxColorValue=255))))
+mtext("(B)", side=3, adj=-0.15)
+points(precol84[precol84=="Vc"],persist$percent.precol[persist$Species=="Vc"&persist$Day=="84"], pch=20, col=rgb(red=25,blue=255,green=178,maxColorValue=255))
+points(precol84[precol84=="Tv"],persist$percent.precol[persist$Species=="Tv"&persist$Day=="84"], pch=20, col=rgb(red=50,blue=0,green=255,maxColorValue=255))
+points(precol84[precol84=="Hf"],persist$percent.precol[persist$Species=="Hf"&persist$Day=="84"], pch=20, col=rgb(red=229,blue=50,green=25,maxColorValue=255))
+}
+dev.off()
+```
+
+###Rarefying exploration (incl. Fig S5)
+```{r explore_rarefaction}
+#Subsample down to lowest read number - 3708 (sample 1568)
+eirar1<-rrarefy(eibact3, 3708)
+eirar2<-rrarefy(eibact3, 3708)
+
+#Richness for the single-rarefied data
+plot((rowSums(eirar1>0))~eidepth2)
+plot((rowSums(eirar2>0))~eidepth2)
+
+#Rarefaction curve
+spcol=c((rgb(red=0,blue=0,green=0,maxColorValue=255)),(rgb(red=25,blue=255,green=178,maxColorValue=255)),
+        (rgb(red=50,blue=0,green=255,maxColorValue=255)),(rgb(red=229,blue=50,green=25,maxColorValue=255)))
+
+#Fig S5
+pdf("rarefaction_curve.pdf", height=6,width=9)
+rarecurve(eibact3, step=250, col=spcol[as.numeric(eimetadata2$Species)], lwd=2, ylab="OTUs", label=FALSE)
+legend("topleft", inset=c(0,0.05),  c("Control","Vc", "Tv", "Hf"), lwd=3, bty="n", cex=0.8,
+       col=spcol)
+dev.off()
+
+#Fourth root transformation used to squash abundance differences
+froot=(eibact3)^(1/4)
+  
+#Test for equal dispersion between treatments (important for PERMANOVA).
+#Test for equal dispersion on unrarified data. 
+dist<-vegdist((eibact3), method="bray")
+
+betadisper(dist, eimetadata2$Species) 
+betadisper(dist, eimetadata2$Season) 
+betadisper(dist, eimetadata2$Day) 
+
+disp.model1 <- anova(betadisper (dist, eimetadata2$Species))
+TukeyHSD(betadisper (dist, eimetadata2$Species))
+disp.model2 <- anova(betadisper (dist, eimetadata2$Season))
+TukeyHSD(betadisper (dist, eimetadata2$Season))
+disp.model3 <- anova(betadisper (dist, eimetadata2$Day))
+TukeyHSD(betadisper (dist, eimetadata2$Day))
+
+#Test for equal dispersion on fourth root transformed data 
+frdist<-vegdist((froot), method="bray")
+
+betadisper(frdist, eimetadata2$Species) 
+betadisper(frdist, eimetadata2$Season) 
+betadisper(frdist, eimetadata2$Day) 
+
+disp.model4 <- anova(betadisper (frdist, eimetadata2$Species))
+TukeyHSD(betadisper (frdist, eimetadata2$Species))
+disp.model5 <- anova(betadisper (frdist, eimetadata2$Season))
+TukeyHSD(betadisper (dist, eimetadata2$Season))
+disp.model6 <- anova(betadisper (frdist, eimetadata2$Day))
+TukeyHSD(betadisper (dist, eimetadata2$Day))
+```
+
+###Archaea exploration
+```{r explore_archaea}
+nrow(eibact1[eibact1$Kingdom=="Archaea",])
+nrow(eibact1[eibact1$Kingdom=="Bacteria",])
+nrow(eibact1[eibact1$Kingdom=="Unassigned",])
+
+#Pull out archaeal OTUS
+archaea<-eibact1[eibact1$Kingdom=="Archaea",2:70]
+#Find which samples are represented
+arch_postive<-colnames(archaea[,(colSums(archaea)>0)])
+eimetadata2[eimetadata2$X.SampleID %in% arch_postive,]
+colSums(eibact1[,colnames(eibact1) %in% arch_postive])
+#Count archaeal read numbers
+colSums(archaea)
+#Count % read numbers
+(colSums(archaea)/colSums(eibact1[,2:70]))*100
+#Look at archaeal taxonomy
+eibact1[eibact1$Kingdom=="Archaea",71:77]
+#Number of reads per OTU
+cbind(eibact1[eibact1$Kingdom=="Archaea",71:73], rowSums(archaea))
+#Number of observations per OTU
+cbind(eibact1[eibact1$Kingdom=="Archaea",71:73], rowSums(archaea>0))
+```
+
+
+##Presence/absence analysis
+```{r amp_success}
+success %>% 
+  group_by(Season, Species, Day) %>% 
+  tally(Success)
+
+#Modelling presence/absence of success (Bernoulli GLM)
+sucmod<-glm(Success~Season+Species+Day, family=binomial (link="cloglog"), data=success)
+summary(sucmod)
+```
+###Fig 1
+```{r fig1}
+{pdf("success.pdf", height=4, width=8)
+par(mfrow=c(1,3), mar=c(5,5,2,3))
+plot(success$First_PCR~success$Season, ylab="Proportion amplified", xlab="Season")
+mtext("(A)", side=3, adj=-0.2)
+plot(success$First_PCR~success$Species, ylab="Proportion amplified", xlab="Precoloniser")
+mtext("(B)", side=3, adj=-0.2)
+plot(success$First_PCR~success$Day, ylab="Proportion amplified", xlab="Days in field")
+mtext("(C)", side=3, adj=-0.2)
+dev.off()
+}
+```
+
+##Bray-Curtis NMDS on raw data
+```{r NMDS}
+eiBCnmds<- metaMDS(eibact3, trymax = 500, k=4, pc="TRUE", distance = "bray", autotransform = FALSE)
+eiBCnmds
+```
+###Fig S1
+```{r figS1}
+pdf("NMDS_supplemental.pdf")
+{
+  par(mfrow=c(2,1), mar=c(5,5,1,1))
+  #Colour by sequencing depth
+  plot(eiBCnmds$points[,2]~eiBCnmds$points[,1], pch=20, col=rgb(red=255,blue=0,green=0,alpha=grad,maxColorValue=255), xlab="NMDS1", ylab="NMDS2")
+  mtext("(A)", side=3, adj=-0.1)
+  #Plot by extraction kit
+  plot(eiBCnmds$points[,3]~eiBCnmds$points[,1], pch=20, col=eimetadata2$Extraction_kit, xlab="NMDS1", ylab="NMDS3")
+  mtext("(B)", side=3, adj=-0.1)
+}
+dev.off()
+```
+###Fig 2
+```{r fig2}
+pdf("NMDS_multiplot.pdf", height=8, width=12)
+{
+  par(mfrow=c(2,2), mar=c(5,5,1,1))
+  #Colour by precoloniser on axes 1&3
+  plot(eiBCnmds$points[,3]~eiBCnmds$points[,1], type="n", xlab="NMDS1", ylab="NMDS3")
+  legend("topleft",  c("Control","Vc", "Tv", "Hf"), pch=c(20,20,20,20), bty="n", cex=0.8,
+         col=c((rgb(red=0,blue=0,green=0,maxColorValue=255)),(rgb(red=25,blue=255,green=178,maxColorValue=255)),
+               (rgb(red=50,blue=0,green=255,maxColorValue=255)),(rgb(red=229,blue=50,green=25,maxColorValue=255))))
+  mtext("(A)", side=3, adj=-0.1)
+  points(eiBCnmds$points[eimetadata2$Species=="C",3]~eiBCnmds$points[eimetadata2$Species=="C",1], pch=20, col=rgb(red=0,blue=0,green=0,maxColorValue=255))
+  ordiellipse(eiBCnmds$points[eimetadata2$Species=="C",], eimetadata2$Species[eimetadata2$Species=="C"], choices=c(1,3), conf=0.95, col=rgb(red=0,blue=0,green=0,maxColorValue=255))
+  points(eiBCnmds$points[eimetadata2$Species=="Vc",3]~eiBCnmds$points[eimetadata2$Species=="Vc",1], pch=20, col=rgb(red=25,blue=255,green=178,maxColorValue=255))
+  ordiellipse(eiBCnmds$points[eimetadata2$Species=="Vc",], eimetadata2$Species[eimetadata2$Species=="Vc"], choices=c(1,3), conf=0.95, col=rgb(red=25,blue=255,green=178,maxColorValue=255))
+  points(eiBCnmds$points[eimetadata2$Species=="Tv",3]~eiBCnmds$points[eimetadata2$Species=="Tv",1], pch=20, col=rgb(red=50,blue=0,green=255,maxColorValue=255))
+  ordiellipse(eiBCnmds$points[eimetadata2$Species=="Tv",], eimetadata2$Species[eimetadata2$Species=="Tv"], choices=c(1,3), conf=0.95, col=rgb(red=50,blue=0,green=255,maxColorValue=255))
+  points(eiBCnmds$points[eimetadata2$Species=="Hf",3]~eiBCnmds$points[eimetadata2$Species=="Hf",1], pch=20, col=rgb(red=229,blue=50,green=25,maxColorValue=255))
+  ordiellipse(eiBCnmds$points[eimetadata2$Species=="Hf",], eimetadata2$Species[eimetadata2$Species=="Hf"], choices=c(1,3), conf=0.95, col=rgb(red=229,blue=50,green=25,maxColorValue=255))
+  ordiellipse(eiBCnmds$points[eimetadata2$Species=="Hf"&eimetadata2$X.SampleID!="24",], eimetadata2$Species[eimetadata2$Species=="Hf"&eimetadata2$X.SampleID!="24"], choices=c(1,3), conf=0.95, lty=2, col=rgb(red=229,blue=50,green=25,maxColorValue=255))
+  #Colour by season on axes 1&3
+  plot(eiBCnmds$points[,3]~eiBCnmds$points[,1], type="n", xlab="NMDS1", ylab="NMDS3")
+  legend("topleft",  c("Spring","Autumn"), pch=c(20,20), bty="n",  cex=0.8,
+         col=c((rgb(red=50,blue=0,green=255,maxColorValue=255)),(rgb(red=229,blue=50,green=25,maxColorValue=255))))
+  mtext("(B)", side=3, adj=-0.1)
+  points(eiBCnmds$points[eimetadata2$Season=="Spring",3]~eiBCnmds$points[eimetadata2$Season=="Spring",1], pch=20, col=rgb(red=50,blue=0,green=255,maxColorValue=255))
+  points(eiBCnmds$points[eimetadata2$Season=="Autumn",3]~eiBCnmds$points[eimetadata2$Season=="Autumn",1], pch=20, col=rgb(red=229,blue=50,green=25,maxColorValue=255))
+  #Colour by day on axes 1&3
+  plot(eiBCnmds$points[,3]~eiBCnmds$points[,1], type="n", xlab="NMDS1", ylab="NMDS3")
+  legend("topleft",  c("14 days","84 days"), pch=c(20,20), bty="n",  cex=0.8,
+         col=c((rgb(red=0,blue=0,green=0,maxColorValue=255)),(rgb(red=229,blue=50,green=25,maxColorValue=255))))
+  mtext("(C)", side=3, adj=-0.1)
+  points(eiBCnmds$points[eimetadata2$Day=="14",3]~eiBCnmds$points[eimetadata2$Day=="14",1], pch=20, col=rgb(red=0,blue=0,green=0,maxColorValue=255))
+  points(eiBCnmds$points[eimetadata2$Day=="84",3]~eiBCnmds$points[eimetadata2$Day=="84",1], pch=20, col=rgb(red=229,blue=50,green=25,maxColorValue=255))
+  #Colour by set on axes 1&3
+  plot(eiBCnmds$points[,3]~eiBCnmds$points[,1], type="n", xlab="NMDS1", ylab="NMDS3")
+  legend("topleft",  c("Spring set 1","Spring set2","Spring set 3","Autumn set 1","Autumn set 2","Autumn set 3"), 
+         pch=c(20,20,20,18,18,18), bty="n",  cex=0.8,
+         col=c((rgb(red=50,blue=0,green=255,maxColorValue=255)),(rgb(red=25,blue=255,green=178,maxColorValue=255)),
+               (rgb(red=101,blue=255,green=76,maxColorValue=255)),(rgb(red=255,blue=50,green=255,maxColorValue=255)),
+               (rgb(red=255,blue=0,green=127,maxColorValue=255)),(rgb(red=229,blue=50,green=25,maxColorValue=255))))
+  mtext("(D)", side=3, adj=-0.1)
+  points(eiBCnmds$points[eimetadata2$Set_sequential=="4",3]~eiBCnmds$points[eimetadata2$Set_sequential=="4",1], pch=20, col=rgb(red=50,blue=0,green=255,maxColorValue=255))
+  points(eiBCnmds$points[eimetadata2$Set_sequential=="5",3]~eiBCnmds$points[eimetadata2$Set_sequential=="5",1], pch=20, col=rgb(red=25,blue=255,green=178,maxColorValue=255))
+  points(eiBCnmds$points[eimetadata2$Set_sequential=="6",3]~eiBCnmds$points[eimetadata2$Set_sequential=="6",1], pch=20, col=rgb(red=101,blue=255,green=76,maxColorValue=255))
+  points(eiBCnmds$points[eimetadata2$Set_sequential=="1",3]~eiBCnmds$points[eimetadata2$Set_sequential=="1",1], pch=18, col=rgb(red=255,blue=50,green=255,maxColorValue=255))
+  points(eiBCnmds$points[eimetadata2$Set_sequential=="2",3]~eiBCnmds$points[eimetadata2$Set_sequential=="2",1], pch=18, col=rgb(red=255,blue=0,green=127,maxColorValue=255))
+  points(eiBCnmds$points[eimetadata2$Set_sequential=="3",3]~eiBCnmds$points[eimetadata2$Set_sequential=="3",1], pch=18, col=rgb(red=229,blue=50,green=25,maxColorValue=255))
+}
+dev.off()
+```
+
+##PCA with Hellinger transformation, for comparison with NMDS
+```{r hellinger_pca}
+hpca<-prcomp(decostand(eibact3, "hellinger")) 
+summary(hpca)
+plot(hpca) 
+hpca$sdev^2
+```
+###Plot coloured by sequencing depth and other predictors (Fig S2)
+```{r figS2}
+pdf("Hellinger_multiplot.pdf")
+{
+par(mfrow=c(3,2), mar=c(5,5,1,1))
+plot(hpca$x, pch=20, col=rgb(red=255,blue=0,green=0,alpha=grad,maxColorValue=255))
+mtext("(A)", side=3, adj=-0.2)
+plot(hpca$x, pch=20, col=eimetadata2$Species)
+legend('topleft', legend = levels(eimetadata2$Species), col = 1:4, bty="n", pch = 20)
+mtext("(B)", side=3, adj=-0.2)
+plot(hpca$x, pch=20, col=eimetadata2$Season)
+legend('topleft', legend = levels(eimetadata2$Season), col = 1:2, bty="n", pch = 20)
+mtext("(C)", side=3, adj=-0.2)
+plot(hpca$x, pch=20, col=eimetadata2$Day)
+legend('topleft', legend = levels(eimetadata2$Day), col = 1:2, bty="n", pch = 20)
+mtext("(D)", side=3, adj=-0.2)
+plot(hpca$x, pch=20, col=eimetadata2$Set_sequential)
+legend('topleft', legend = levels(eimetadata2$Set_sequential), col = 1:6, bty="n", pch = 20)
+mtext("(E)", side=3, adj=-0.2)
+}
+dev.off()
+```
+
+##Subset for time analysis: both seasons, 14 and 84 days, C blocks only
+```{r time_subset}
+timedat<-eibact3[eimetadata2$Species=="C",]
+timedat<-timedat[,(!colSums(timedat)==0)]
+timemeta<-eimetadata2[eimetadata2$Species=="C",]
+timedepth<-rowSums(timedat)
+timerich<-rowSums(timedat>0)
+
+#Dispersion of time data
+timedist<-vegdist((timedat), method="bray")
+betadisper(timedist, timemeta$Season) 
+betadisper(timedist, timemeta$Day) 
+TukeyHSD(betadisper (timedist, timemeta$Season))
+TukeyHSD(betadisper (timedist, timemeta$Day))
+
+plot(timedepth~timemeta$Season)
+plot(timedepth~timemeta$Day)
+```
+
+###PERMANOVA on time subset
+```{r time_permanova}
+timepma<-adonis(timedat ~ timedepth + timemeta$Season * timemeta$Day, permutations = 999, method = "bray", strata = NULL)
+timepma
+boxplot(timepma$coefficients~rownames(timepma$coefficients))
+
+#Pairwise comparisons between treatments
+#Create subsets of the response variables (OTUS) in all pairwise combinations
+{
+  A1484=subset(timedat, timemeta$Season=="Autumn")
+  S1484=subset(timedat, timemeta$Season=="Spring")
+  AS14=subset(timedat, timemeta$Day=="14")
+  AS84=subset(timedat, timemeta$Day=="84")
+}
+#Create subsets of the predictor variables (metadata) in all pairwise combinations
+{
+  mA1484=subset(timemeta, timemeta$Season=="Autumn")
+  mS1484=subset(timemeta, timemeta$Season=="Spring")
+  mAS14=subset(timemeta, timemeta$Day=="14")
+  mAS84=subset(timemeta, timemeta$Day=="84")
+} 
+#Create subsets of the depth for all pairwise combinations
+{
+  dA1484=subset(timedepth, timemeta$Season=="Autumn")
+  dS1484=subset(timedepth, timemeta$Season=="Spring")
+  dAS14=subset(timedepth, timemeta$Day=="14")
+  dAS84=subset(timedepth, timemeta$Day=="84")
+} 
+#Run PERMANOVA on all pairwise combinations
+pmaA1484<-adonis(A1484 ~ dA1484 + mA1484$Day, permutations = 999, method = "bray", strata = NULL)
+pmaS1484<-adonis(S1484 ~ dS1484 + mS1484$Day, permutations = 999, method = "bray", strata = NULL)
+pmaAS14<-adonis(AS14 ~ dAS14 + mAS14$Season, permutations = 999, method = "bray", strata = NULL)
+pmaAS84<-adonis(AS84 ~ dAS84 + mAS84$Season, permutations = 999, method = "bray", strata = NULL)
+
+#Dispersion tests for all the pairwise combination datasets
+A1484dist<-vegdist((A1484), method="bray")
+S1484dist<-vegdist((S1484), method="bray")
+AS14dist<-vegdist((AS14), method="bray")
+AS84dist<-vegdist((AS84), method="bray")
+TukeyHSD(betadisper (A1484dist, mA1484$Day))
+TukeyHSD(betadisper (S1484dist, mS1484$Day))
+TukeyHSD(betadisper (AS14dist, mAS14$Season))
+TukeyHSD(betadisper (AS84dist, mAS84$Season))
+```
+
+###Richness analysis on time subset
+```{r time_richness}
+timemod<-glm.nb(timerich ~ timedepth + timemeta$Season + timemeta$Day + timemeta$Season:timemeta$Day, link=sqrt)
+sresid1<-(timemod$residuals-mean(timemod$residuals))/sd(timemod$residuals)
+qqnorm(sresid1)
+abline(0,1)
+hist(sresid1)
+plot(sresid1~timemod$fitted.values)
+#Calculate theta
+timemod$deviance/timemod$df.residual
+plot(timemod)
+summary(timemod)
+#LR test for the interaction
+timemod2<-update(timemod, .~. -timemeta$Season:timemeta$Day)
+anova(timemod, timemod2)
+```
+
+##Subset for species comparison: spring day 84 without Vc
+```{r spring_subset}
+springspdat<-eibact3[eimetadata2$Season=="Spring" & eimetadata2$Day=="84" & eimetadata2$Species!="Vc",]
+springspdat<-springspdat[,(!colSums(springspdat)==0)]
+springspmeta<-eimetadata2[eimetadata2$Season=="Spring" & eimetadata2$Day=="84" & eimetadata2$Species!="Vc",]
+springspdepth<-rowSums(springspdat)
+springsprich<-rowSums(springspdat>0)
+
+#Dispersion of spring species data
+springspdist<-vegdist((springspdat), method="bray")
+betadisper(springspdist, springspmeta$Species) 
+TukeyHSD(betadisper (springspdist, springspmeta$Species))
+
+plot(springspdepth~springspmeta$Species)
+```
+
+###PERMANOVA on spring data
+```{r spring_permanova}
+springsppma<-adonis(springspdat ~ springspdepth + springspmeta$Species, permutations = 999, method = "bray", strata = NULL)
+springsppma
+boxplot(springsppma$coefficients~rownames(springsppma$coefficients))
+
+#Pairwise comparisons between treatments
+#Create subsets of the response variables (OTUS) in all pairwise combinations
+{
+  CTv=subset(springspdat, springspmeta$Species!="Hf")
+  CHf=subset(springspdat, springspmeta$Species!="Tv")
+  TvHf=subset(springspdat, springspmeta$Species!="C")
+}
+#Create subsets of the predictor variables (metadata) in all pairwise combinations
+{
+  mCTv=subset(springspmeta, springspmeta$Species!="Hf")
+  mCHf=subset(springspmeta, springspmeta$Species!="Tv")
+  mTvHf=subset(springspmeta, springspmeta$Species!="C")
+} 
+#Create subsets of the depth for all pairwise combinations
+{
+  dCTv=subset(springspdepth, springspmeta$Species!="Hf")
+  dCHf=subset(springspdepth, springspmeta$Species!="Tv")
+  dTvHf=subset(springspdepth, springspmeta$Species!="C")
+} 
+#Run PERMANOVA on all pairwise combinations
+pmaCTv<-adonis(CTv ~ dCTv + mCTv$Species, permutations = 999, method = "bray", strata = NULL)
+pmaCHf<-adonis(CHf ~ dCHf + mCHf$Species, permutations = 999, method = "bray", strata = NULL)
+pmaTvHf<-adonis(TvHf ~ dTvHf + mTvHf$Species, permutations = 999, method = "bray", strata = NULL)
+#Dispersion already calculated by the Tukey HSD as there is only one categorical variable in the dataset
+```
+
+###Richness analysis on spring data
+```{r spring_richness}
+springspmod<-glm.nb(springsprich ~ springspdepth + springspmeta$Species)
+sresid2<-(springspmod$residuals-mean(springspmod$residuals))/sd(springspmod$residuals)
+qqnorm(sresid2)
+abline(0,1)
+hist(sresid1)
+plot(sresid2~springspmod$fitted.values)
+summary(springspmod)
+#Calculate theta
+springspmod$deviance/springspmod$df.residual
+plot(springspmod)
+```
+
+##Subset for species comparison: autumn day 84, C & Vc
+```{r autumn_subset}
+auspdat<-eibact3[eimetadata2$Season=="Autumn" & eimetadata2$Day=="84",]
+auspdat<-auspdat[,(!colSums(auspdat)==0)]
+auspmeta<-eimetadata2[eimetadata2$Season=="Autumn" & eimetadata2$Day=="84",]
+auspdepth<-rowSums(auspdat)
+ausprich<-rowSums(auspdat>0)
+
+#Dispersion of autumn species data
+auspdist<-vegdist((auspdat), method="bray")
+betadisper(auspdist, auspmeta$Species) 
+betadisper(auspdist, auspmeta$Set_sequential) 
+TukeyHSD(betadisper (auspdist, auspmeta$Species))
+TukeyHSD(betadisper (auspdist, auspmeta$Set_sequential))
+
+plot(auspdepth~auspmeta$Species)
+plot(auspdepth~auspmeta$Set_sequential)
+```
+
+###PERMANOVA on autumn data
+```{r autumn_permanova}
+ausppma<-adonis(auspdat ~ auspdepth + auspmeta$Species * auspmeta$Set_sequential, permutations = 999, method = "bray", strata = NULL)
+ausppma
+boxplot(ausppma$coefficients~rownames(ausppma$coefficients))
+```
+
+###Richness analysis on autumn data
+```{r autumn_richness}
+auspmod<-glm.nb(ausprich ~ auspdepth + Species * Set_sequential, data=auspmeta)
+sresid3<-(auspmod$residuals-mean(auspmod$residuals))/sd(auspmod$residuals)
+qqnorm(sresid3)
+abline(0,1)
+plot(sresid3~auspmod$fitted.values)
+hist(sresid3)
+#Calculate theta
+auspmod$deviance/auspmod$df.residual
+summary(auspmod)
+#LR test for the interaction
+auspmod2<-update(auspmod, .~. -Species:Set_sequential)
+anova(auspmod, auspmod2)
+
+lsmeans(auspmod, pairwise~Set_sequential:Species, adjust="tukey")
+```
+
+##Richness plotting (Fig 3)
+```{r overall_richness}
+eirichness<-rowSums(eibact3>0) #Counts the number of occurrances for each OTU (because TRUE=1, FALSE=0)
+hist(eirichness)
+
+##Raw richness
+#Plot richness against precoloniser
+plot(eirichness~eimetadata2$Species)
+#Do the same for season
+plot(eirichness~eimetadata2$Season)
+#Do the same for day
+plot(eirichness~eimetadata2$Day)
+#Do the same for set
+plot(eirichness~eimetadata2$Set_sequential)
+#Plot richness against sequencing depth
+plot(eirichness~eidepth2)
+
+##Detrended richness
+richsqrt<-sqrt(eirichness)
+detmod<-glm(richsqrt~eidepth2)
+dsresid<-(detmod$residuals-mean(detmod$residuals))/sd(detmod$residuals)
+qqnorm(dsresid)
+abline(0,1)
+hist(dsresid)
+plot(dsresid~detmod$fitted.values)
+
+plot(detmod)
+
+#Back-transformed residuals - check
+sqrtfitted<-(detmod$fitted.values)^2
+btresid<-eirichness - sqrtfitted
+
+#Plot richness against sequencing depth
+plot(btresid~eidepth2)
+
+#Plot richness against precoloniser
+plot(btresid~eimetadata2$Species)
+#Do the same for season
+plot(btresid~eimetadata2$Season)
+#Do the same for day
+plot(btresid~eimetadata2$Day)
+#Do the same for set
+plot(btresid~eimetadata2$Set_sequential)
+
+
+pdf("richness_fiveway.pdf", height=12, width=10)
+{
+par(mfrow=c(3,2), mar=c(5,5,1,1))
+#Boxplot by precoloniser
+plot(btresid~eimetadata2$Species, xlab="Precoloniser", ylab="Detrended richness", notch=T)
+legend("topleft", inset=c(0,0.05),  c("Spring","Autumn"), pch=c(20,20), bty="n", cex=0.8,
+       col=c((rgb(red=50,blue=0,green=255,maxColorValue=255)),(rgb(red=229,blue=50,green=25,maxColorValue=255))))
+mtext("(A)", side=3, adj=-0.15)
+points(eimetadata2$Species[eimetadata2$Season=="Autumn"], btresid[eimetadata2$Season=="Autumn"], pch=20, col=rgb(red=229,blue=50,green=25,maxColorValue=255))
+points(eimetadata2$Species[eimetadata2$Season=="Spring"], btresid[eimetadata2$Season=="Spring"], pch=20, col=rgb(red=50,blue=0,green=255,maxColorValue=255))
+#Boxplot by season
+plot(btresid~eimetadata2$Season, xlab="Season", ylab="Detrended richness", notch=T)
+legend("topleft", inset=c(0,0.05),  c("14 days","84 days"), pch=c(20,20), bty="n", cex=0.8,
+       col=c((rgb(red=0,blue=0,green=0,maxColorValue=255)),(rgb(red=229,blue=50,green=25,maxColorValue=255))))
+mtext("(B)", side=3, adj=-0.15)
+points(eimetadata2$Season[eimetadata2$Day=="14"], btresid[eimetadata2$Day=="14"], pch=20, col=rgb(red=0,blue=0,green=0,maxColorValue=255))
+points(eimetadata2$Season[eimetadata2$Day=="84"], btresid[eimetadata2$Day=="84"], pch=20, col=rgb(red=229,blue=50,green=25,maxColorValue=255))
+#Boxplot by season (control only)
+plot(btresid[eimetadata2$Species=="C"]~eimetadata2$Season[eimetadata2$Species=="C"], xlab="Season", ylab="Detrended richness", notch=T)
+legend("topleft", inset=c(0,0.05),  c("14 days","84 days"), pch=c(20,20), bty="n", cex=0.8,
+       col=c((rgb(red=0,blue=0,green=0,maxColorValue=255)),(rgb(red=229,blue=50,green=25,maxColorValue=255))))
+mtext("(C)", side=3, adj=-0.15)
+points(eimetadata2$Season[eimetadata2$Day=="14"&eimetadata2$Species=="C"], btresid[eimetadata2$Day=="14"&eimetadata2$Species=="C"], pch=20, col=rgb(red=0,blue=0,green=0,maxColorValue=255))
+points(eimetadata2$Season[eimetadata2$Day=="84"&eimetadata2$Species=="C"], btresid[eimetadata2$Day=="84"&eimetadata2$Species=="C"], pch=20, col=rgb(red=229,blue=50,green=25,maxColorValue=255))
+#Boxplot by day, coloured by species
+plot(btresid~eimetadata2$Day, xlab="Day", ylab="Detrended richness", notch=T)
+legend("topleft", inset=c(0,0.05),  c("Control","Vc", "Tv", "Hf"), pch=c(20,20,20,20), bty="n", cex=0.8,
+       col=c((rgb(red=0,blue=0,green=0,maxColorValue=255)),(rgb(red=25,blue=255,green=178,maxColorValue=255)),
+             (rgb(red=50,blue=0,green=255,maxColorValue=255)),(rgb(red=229,blue=50,green=25,maxColorValue=255))))
+mtext("(D)", side=3, adj=-0.15)
+points(eimetadata2$Day[eimetadata2$Species=="C"], btresid[eimetadata2$Species=="C"], pch=20, col=rgb(red=0,blue=0,green=0,maxColorValue=255))
+points(eimetadata2$Day[eimetadata2$Species=="Vc"], btresid[eimetadata2$Species=="Vc"], pch=20, col=rgb(red=25,blue=255,green=178,maxColorValue=255))
+points(eimetadata2$Day[eimetadata2$Species=="Tv"], btresid[eimetadata2$Species=="Tv"], pch=20, col=rgb(red=50,blue=0,green=255,maxColorValue=255))
+points(eimetadata2$Day[eimetadata2$Species=="Hf"], btresid[eimetadata2$Species=="Hf"], pch=20, col=rgb(red=229,blue=50,green=25,maxColorValue=255))
+#Boxplot by set
+plot(btresid~eimetadata2$Set_sequential, xlab="Set", ylab="Detrended richness", notch=T)
+legend("topleft", inset=c(0,0.05), c("Control","Vc", "Tv", "Hf"), pch=c(20,20,20,20), bty="n", cex=0.8,
+       col=c((rgb(red=0,blue=0,green=0,maxColorValue=255)),(rgb(red=25,blue=255,green=178,maxColorValue=255)),
+             (rgb(red=50,blue=0,green=255,maxColorValue=255)),(rgb(red=229,blue=50,green=25,maxColorValue=255))))
+mtext("(E)", side=3, adj=-0.15)
+points(eimetadata2$Set_sequential[eimetadata2$Species=="C"], btresid[eimetadata2$Species=="C"], pch=20, col=rgb(red=0,blue=0,green=0,maxColorValue=255))
+points(eimetadata2$Set_sequential[eimetadata2$Species=="Vc"], btresid[eimetadata2$Species=="Vc"], pch=20, col=rgb(red=25,blue=255,green=178,maxColorValue=255))
+points(eimetadata2$Set_sequential[eimetadata2$Species=="Tv"], btresid[eimetadata2$Species=="Tv"], pch=20, col=rgb(red=50,blue=0,green=255,maxColorValue=255))
+points(eimetadata2$Set_sequential[eimetadata2$Species=="Hf"], btresid[eimetadata2$Species=="Hf"], pch=20, col=rgb(red=229,blue=50,green=25,maxColorValue=255))
+}
+dev.off()
+```
+
+##Metacoder plots
+```{r metacoder_prep}
+#Take proportions and make into percentages, only including samples in the eibact3 dataframe
+eibactprop<-(eibact1[,colnames(eibact1)%in%rownames(eibact3)]*100)
+#Create a total abundance column
+eibactprop$totab<-rowSums(eibactprop)
+#Taxonomy information is currently stored in multiple columns - combine them into one |-separated column
+eibactprop$mergetax<-paste(eibact1$Kingdom,"|",eibact1$Phylum,"|",eibact1$Class,"|",
+                           eibact1$Order,"|",eibact1$Family,"|",eibact1$Genus,"|",
+                           eibact1$Species)
+#Remove unwanted characters from the taxonomy column
+eibactprop$mergetax<-gsub("\\[|\\]","",eibactprop$mergetax)
+
+
+#Create taxmap object
+#Check that the last column contains the taxonomy
+colnames(eibactprop[66])
+#Export as a csv and read it back in
+write.csv(eibactprop,"eibactprop.csv",quote = FALSE)
+eibacttaxmap<-parse_taxonomy_table("eibactprop.csv", taxon_col = c("class" = -1), 
+                                 other_col_type="obs_info", sep=",",
+                                 class_sep = "\\|")
+
+eibacttaxmap
+#Remove reads unassigned at the Kingdom level - need to first convert name column from character to factor
+#Also remove Archaea as very scarce and throwing the graphs off
+eibacttaxmap$taxon_data$name<-as.factor(eibacttaxmap$taxon_data$name)
+eibacttaxmap<-filter_taxa(eibacttaxmap, name %in% c("Unassigned ", "Archaea "), subtaxa = TRUE, invert=TRUE)
+#Remove 'species' and 'genus' levels as going beyond family level is not very meaningful for 16S rRNA data
+eibacttaxmap<-filter_taxa(eibacttaxmap, n_supertaxa < 5, reassign_obs = TRUE)
+
+#Overall heat tree
+heat_tree(eibacttaxmap, node_color = n_obs,
+          node_size = n_obs,
+          node_color_range = c("#5088a3", "#64a9ca", "#fecf9e", "#f9a049", "#a5764c"),
+          edge_size = n_obs,
+          overlap_avoidance=0.7,
+          node_label = name)
+```
+
+###Create subsets of the taxmap object for each precoloniser at day 84, split by season
+```{r metacoder-precoloniser}
+#Create a list of sample names for each precoloniser
+{
+cau84blocks<-as.character(subset(eimetadata2$X.SampleID, eimetadata2$Species=="C" 
+                                 & eimetadata2$Day=="84" & eimetadata2$Season=="Autumn"))
+vcau84blocks<-as.character(subset(eimetadata2$X.SampleID, eimetadata2$Species=="Vc" 
+                                  & eimetadata2$Day=="84" & eimetadata2$Season=="Autumn"))
+cs84blocks<-as.character(subset(eimetadata2$X.SampleID, eimetadata2$Species=="C" 
+                                & eimetadata2$Day=="84" & eimetadata2$Season=="Spring"))
+tvs84blocks<-as.character(subset(eimetadata2$X.SampleID, eimetadata2$Species=="Tv" 
+                                 & eimetadata2$Day=="84" & eimetadata2$Season=="Spring"))
+hfs84blocks<-as.character(subset(eimetadata2$X.SampleID, eimetadata2$Species=="Hf" 
+                                 & eimetadata2$Day=="84" & eimetadata2$Season=="Spring"))
+}
+#First select only the relevant observation columns, then remove observation rows with 0 sum (i.e. OTUs that don't occur in any samples in that subset)
+{
+cau84<-select_obs(eibacttaxmap, one_of(cau84blocks))
+cau84<-filter_obs(cau84, rowSums(cau84$obs_data[,-1])>0)
+vcau84<-select_obs(eibacttaxmap, one_of(vcau84blocks))
+vcau84<-filter_obs(vcau84, rowSums(vcau84$obs_data[,-1])>0)
+cs84<-select_obs(eibacttaxmap, one_of(cs84blocks))
+cs84<-filter_obs(cs84, rowSums(cs84$obs_data[,-1])>0)
+tvs84<-select_obs(eibacttaxmap, one_of(tvs84blocks))
+tvs84<-filter_obs(tvs84, rowSums(tvs84$obs_data[,-1])>0)
+hfs84<-select_obs(eibacttaxmap, one_of(hfs84blocks))
+hfs84<-filter_obs(hfs84, rowSums(hfs84$obs_data[,-1])>0)
+}
+
+#Remove taxa that don't occur in that subset
+{
+cau84<-filter_taxa(cau84, n_obs >= 1)
+vcau84<-filter_taxa(vcau84, n_obs >= 1)
+cs84<-filter_taxa(cs84, n_obs >= 1)
+tvs84<-filter_taxa(tvs84, n_obs >= 1)
+hfs84<-filter_taxa(hfs84, n_obs >= 1)
+}
+
+#Work out the total abundance in the subset for each OTU
+{
+cau84<-mutate_obs(cau84, subabun = rowSums(cau84$obs_data[,-1]))
+vcau84<-mutate_obs(vcau84, subabun = rowSums(vcau84$obs_data[,-1]))
+cs84<-mutate_obs(cs84, subabun = rowSums(cs84$obs_data[,-1]))
+tvs84<-mutate_obs(tvs84, subabun = rowSums(tvs84$obs_data[,-1]))
+hfs84<-mutate_obs(hfs84, subabun = rowSums(hfs84$obs_data[,-1]))
+}
+
+#Do read counts for each subset
+{
+cau84<-mutate_taxa(cau84, read_counts = vapply(obs(cau84),
+                                          function(x) sum(cau84$obs_data$subabun[x]), numeric(1)))
+vcau84<-mutate_taxa(vcau84, read_counts = vapply(obs(vcau84),
+                                            function(x) sum(vcau84$obs_data$subabun[x]), numeric(1)))
+cs84<-mutate_taxa(cs84, read_counts = vapply(obs(cs84),
+                                            function(x) sum(cs84$obs_data$subabun[x]), numeric(1)))
+tvs84<-mutate_taxa(tvs84, read_counts = vapply(obs(tvs84),
+                                             function(x) sum(tvs84$obs_data$subabun[x]), numeric(1)))
+hfs84<-mutate_taxa(hfs84, read_counts = vapply(obs(hfs84),
+                                            function(x) sum(hfs84$obs_data$subabun[x]), numeric(1)))
+}
+```
+
+###Heat tree for each precoloniser, with node size by abundance and colour by number of occurrances (Fig 5)
+```{r fig5}
+{
+cau84ht<-heat_tree(cau84, node_color = read_counts, 
+              node_size = read_counts,
+              node_color_range = c("#5088a3", "#64a9ca", "#fecf9e", "#f9a049", "#a5764c"),
+              edge_size = read_counts,
+              overlap_avoidance=0.7,
+              node_label = ifelse(read_counts > 100, as.character(name), NA),
+              node_label_size_trans = "log10",
+              node_label_size_range = c(0.008, 0.02),
+              node_size_axis_label = "Number of OTUs",
+              node_color_axis_label = "Relative read abundance",
+              edge_size_axis_label = "Number of OTUs",
+              title="Control: autumn",
+              title_size = 0.04)
+vcau84ht<-heat_tree(vcau84, node_color = read_counts, 
+               node_size = read_counts,
+               node_color_range = c("#5088a3", "#64a9ca", "#fecf9e", "#f9a049", "#a5764c"),
+               edge_size = read_counts,
+               overlap_avoidance=0.7,
+               node_label = ifelse(read_counts > 100, as.character(name), NA),
+               node_label_size_trans = "log10",
+               node_label_size_range = c(0.008, 0.02),
+               node_size_axis_label = "Number of OTUs",
+               node_color_axis_label = "Relative read abundance",
+               edge_size_axis_label = "Number of OTUs",
+               make_legend = FALSE,
+               title="Vuilleminia: autumn",
+               title_size = 0.04)
+cs84ht<-heat_tree(cs84, node_color = read_counts, 
+               node_size = read_counts,
+               node_color_range = c("#5088a3", "#64a9ca", "#fecf9e", "#f9a049", "#a5764c"),
+               edge_size = read_counts,
+               overlap_avoidance=0.7,
+               node_label = ifelse(read_counts > 100, as.character(name), NA),
+               node_label_size_trans = "log10",
+               node_label_size_range = c(0.008, 0.02),
+               node_size_axis_label = "Number of OTUs",
+               node_color_axis_label = "Relative read abundance",
+               edge_size_axis_label = "Number of OTUs",
+               make_legend = FALSE,
+               title="Control: spring",
+               title_size = 0.04)
+tvs84ht<-heat_tree(tvs84, node_color = read_counts, 
+                  node_size = read_counts,
+                  node_color_range = c("#5088a3", "#64a9ca", "#fecf9e", "#f9a049", "#a5764c"),
+                  edge_size = read_counts,
+                  overlap_avoidance=0.7,
+                  node_label = ifelse(read_counts > 100, as.character(name), NA),
+                  node_label_size_trans = "log10",
+                  node_label_size_range = c(0.008, 0.02),
+                  node_size_axis_label = "Number of OTUs",
+                  node_color_axis_label = "Relative read abundance",
+                  edge_size_axis_label = "Number of OTUs",
+                  make_legend = FALSE,
+                  title="Trametes: spring",
+                  title_size = 0.04)
+hfs84ht<-heat_tree(hfs84, node_color = read_counts, 
+               node_size = read_counts,
+               node_color_range = c("#5088a3", "#64a9ca", "#fecf9e", "#f9a049", "#a5764c"),
+               edge_size = read_counts,
+               overlap_avoidance=0.7,
+               node_label = ifelse(read_counts > 100, as.character(name), NA),
+               node_label_size_trans = "log10",
+               node_label_size_range = c(0.008, 0.02),
+               node_size_axis_label = "Number of OTUs",
+               node_color_axis_label = "Relative read abundance",
+               edge_size_axis_label = "Number of OTUs",
+               make_legend = FALSE,
+               title="Hypholoma: spring",
+               title_size = 0.04)
+}
+
+#Combine the 'precoloniser' trees into one plot 
+pdf("species-metacoder.pdf", width=15, height=10)
+multiplot(cs84ht, cau84ht, tvs84ht, vcau84ht, hfs84ht, cols=3)
+dev.off()
+```
+
+###Create subsets of the taxmap object for controls in each season/day
+```{r metacoder_time}
+#Create a list of sample names for each precoloniser
+{
+  cau14blocks<-as.character(subset(eimetadata2$X.SampleID, eimetadata2$Species=="C" 
+                                   & eimetadata2$Day=="14" & eimetadata2$Season=="Autumn"))
+  cs14blocks<-as.character(subset(eimetadata2$X.SampleID, eimetadata2$Species=="C" 
+                                  & eimetadata2$Day=="14" & eimetadata2$Season=="Spring"))
+  cs14blocks<-gsub(".2","",cs14blocks)
+}
+#First select only the relevant observation columns, then remove observation rows with 0 sum (i.e. OTUs that don't occur in any samples in that subset)
+{
+  cau14<-select_obs(eibacttaxmap, one_of(cau14blocks))
+  cau14<-filter_obs(cau14, rowSums(cau14$obs_data[,-1])>0)
+  cs14<-select_obs(eibacttaxmap, one_of(cs14blocks))
+  cs14<-filter_obs(cs14, rowSums(cs14$obs_data[,-1])>0)
+}
+
+#Remove taxa that don't occur in that subset
+{
+  cau14<-filter_taxa(cau14, n_obs >= 1)
+  cs14<-filter_taxa(cs14, n_obs >= 1)
+}
+
+#Work out the total abundance in the subset for each OTU
+{
+  cau14<-mutate_obs(cau14, subabun = rowSums(cau14$obs_data[,-1]))
+  cs14<-mutate_obs(cs14, subabun = rowSums(cs14$obs_data[,-1]))
+}
+
+#Do read counts for each subset
+{
+  cau14<-mutate_taxa(cau14, read_counts = vapply(obs(cau14),
+                                                 function(x) sum(cau14$obs_data$subabun[x]), numeric(1)))
+  cs14<-mutate_taxa(cs14, read_counts = vapply(obs(cs14),
+                                               function(x) sum(cs14$obs_data$subabun[x]), numeric(1)))
+}
+```
+
+###Heat tree for each time point, with node size by abundance and colour by number of occurrances (Fig 4)
+```{r fig4}
+{
+  cau14ht<-heat_tree(cau14, node_color = read_counts, 
+                     node_size = read_counts,
+                     node_color_range = c("#5088a3", "#64a9ca", "#fecf9e", "#f9a049", "#a5764c"),
+                     edge_size = read_counts,
+                     overlap_avoidance=0.7,
+                     node_label = ifelse(read_counts > 100, as.character(name), NA),
+                     node_label_size_trans = "log10",
+                     node_label_size_range = c(0.008, 0.02),
+                     node_size_axis_label = "Number of OTUs",
+                     node_color_axis_label = "Relative read abundance",
+                     edge_size_axis_label = "Number of OTUs",
+                     title="Autumn 14 d",
+                     title_size = 0.04)
+  cau84ht2<-heat_tree(cau84, node_color = read_counts, 
+                      node_size = read_counts,
+                      node_color_range = c("#5088a3", "#64a9ca", "#fecf9e", "#f9a049", "#a5764c"),
+                      edge_size = read_counts,
+                      overlap_avoidance=0.7,
+                      node_label = ifelse(read_counts > 100, as.character(name), NA),
+                      node_label_size_trans = "log10",
+                      node_label_size_range = c(0.008, 0.02),
+                      node_size_axis_label = "Number of OTUs",
+                      node_color_axis_label = "Relative read abundance",
+                      edge_size_axis_label = "Number of OTUs",
+                      make_legend = FALSE,
+                      title="Autumn 84 d",
+                      title_size = 0.04)
+  cs84ht2<-heat_tree(cs84, node_color = read_counts, 
+                    node_size = read_counts,
+                    node_color_range = c("#5088a3", "#64a9ca", "#fecf9e", "#f9a049", "#a5764c"),
+                    edge_size = read_counts,
+                    overlap_avoidance=0.7,
+                    node_label = ifelse(read_counts > 100, as.character(name), NA),
+                    node_label_size_trans = "log10",
+                    node_label_size_range = c(0.008, 0.02),
+                    node_size_axis_label = "Number of OTUs",
+                    node_color_axis_label = "Relative read abundance",
+                    edge_size_axis_label = "Number of OTUs",
+                    make_legend = FALSE,
+                    title="Spring 84 d",
+                    title_size = 0.04)
+  cs14ht<-heat_tree(cs14, node_color = read_counts, 
+                     node_size = read_counts,
+                     node_color_range = c("#5088a3", "#64a9ca", "#fecf9e", "#f9a049", "#a5764c"),
+                     edge_size = read_counts,
+                     overlap_avoidance=0.7,
+                     node_label = ifelse(read_counts > 100, as.character(name), NA),
+                     node_label_size_trans = "log10",
+                     node_label_size_range = c(0.008, 0.02),
+                     node_size_axis_label = "Number of OTUs",
+                     node_color_axis_label = "Relative read abundance",
+                     edge_size_axis_label = "Number of OTUs",
+                     make_legend = FALSE,
+                     title="Spring 14 d",
+                     title_size = 0.04)
+}
+
+#Combine the trees into one plot 
+pdf("time-metacoder.pdf", width=10, height=10)
+multiplot(cs14ht, cau14ht, cs84ht2, cau84ht2, cols=2)
+dev.off()
+```
